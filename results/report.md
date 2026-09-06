@@ -11,12 +11,13 @@ The input data contains product events in this format:
 date,event,itemid
 ```
 
-Each `itemid` represents a product. For every day, the program streams all
-product events into a Count-Min Sketch and reports products whose estimated
-frequency crosses the heavy-hitter threshold:
+Each `itemid` represents a product. For every day, the program converts event
+types into intent weights, streams those weighted product events into a
+Count-Min Sketch, and reports products whose estimated score crosses the
+heavy-hitter threshold:
 
 ```text
-threshold = total_day_events / k
+threshold = total_day_score / k
 ```
 
 For the current run:
@@ -24,11 +25,20 @@ For the current run:
 ```text
 k = 100
 delta = 0.01
-epsilon = 1 / (2k) = 0.005
+baseline epsilon = 1 / (2k) = 0.005
+stricter epsilon = 1 / (5k) = 0.002
 ```
 
-So a product is considered trending on a day if it appears in about 1% or more
-of that day's events.
+So a product is considered trending on a day if it receives about 1% or more of
+that day's weighted engagement score.
+
+Current event weights:
+
+```text
+view = 1
+addtocart = 3
+transaction = 5
+```
 
 ## Output File
 
@@ -47,7 +57,7 @@ results/daily_heavy_hitters_validated.csv
 Columns:
 
 ```text
-date,itemid,estimated_count,exact_count,error,threshold,total_day_events
+date,itemid,estimated_score,exact_score,error,threshold,total_day_score
 ```
 
 Meaning:
@@ -56,17 +66,17 @@ Meaning:
 |---|---|
 | `date` | Day being analyzed. |
 | `itemid` | Product identifier. |
-| `estimated_count` | Approximate frequency estimated by Count-Min Sketch. |
-| `exact_count` | Exact frequency computed only for validation. |
-| `error` | `estimated_count - exact_count`. |
-| `threshold` | Minimum estimated count needed to qualify as a heavy hitter. |
-| `total_day_events` | Total number of product events on that date. |
+| `estimated_score` | Approximate weighted score estimated by Count-Min Sketch. |
+| `exact_score` | Exact weighted score computed only for validation. |
+| `error` | `estimated_score - exact_score`. |
+| `threshold` | Minimum estimated score needed to qualify as a heavy hitter. |
+| `total_day_score` | Total weighted engagement score on that date. |
 
 ## Exact Count Validation
 
 Count-Min Sketch is used because exact counting every product can be expensive
 in a real streaming system. However, for this project we also computed exact
-counts offline to validate the approximation.
+weighted scores offline to validate the approximation.
 
 Validation output:
 
@@ -77,43 +87,41 @@ results/daily_heavy_hitters_validated.csv
 The validation adds:
 
 ```text
-exact_count,error
+exact_score,error
 ```
 
 where:
 
 ```text
-error = estimated_count - exact_count
+error = estimated_score - exact_score
 ```
 
-For the current run with `k = 100`:
+For the current comparison with `k = 100`:
 
-| Metric | Value |
-|---|---:|
-| CMS reported heavy-hitter rows | 13 |
-| Exact true heavy hitters | 7 |
-| Exact true heavy hitters missed by CMS | 0 |
-| Near-threshold false positives | 6 |
-| Total overestimation error across reported rows | 302 |
-| Maximum overestimation for one row | 34 |
+| Epsilon choice | Width | Counters | Reported rows | True heavy hitters | False positives | Total error | Max error |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `1 / (2k)` | 544 | 2,720 | 10 | 6 | 4 | 233 | 35 |
+| `1 / (5k)` | 1,360 | 6,800 | 6 | 6 | 0 | 56 | 19 |
 
 This is the expected Count-Min Sketch behavior:
 
-- it does not underestimate counts
+- it does not underestimate weighted scores
 - it found all exact heavy hitters
-- it also reported a few products close to the threshold because hash collisions
-  increased their estimated count
+- the looser setting reported a few products close to the threshold because
+  hash collisions increased their estimated score
+- the stricter setting used more buckets and removed those false positives in
+  this dataset
 
 Example:
 
 ```text
-date,itemid,estimated_count,exact_count,error,threshold,total_day_events
-2015-05-03,203248,160,141,19,136.83,13683
+date,itemid,estimated_score,exact_score,error,threshold,total_day_score
+2015-05-24,290250,257,251,6,182.76,18276
 ```
 
-Here product `203248` truly appeared 141 times. Count-Min Sketch estimated 160,
-so the overestimation error was 19. Since the threshold was 136.83, this product
-is still a true heavy hitter.
+Here product `290250` truly received 251 weighted engagement points. Count-Min
+Sketch estimated 257 in the stricter run, so the overestimation error was 6. Since the threshold
+was 182.76, this product is a true weighted heavy hitter.
 
 ## Why Some Days Are Missing
 
@@ -125,7 +133,7 @@ The output file only includes days where at least one product crossed the
 heavy-hitter threshold:
 
 ```text
-estimated_count >= total_day_events / k
+estimated_score >= total_day_score / k
 ```
 
 If a day is missing, it means no product was dominant enough on that day.
@@ -185,7 +193,7 @@ The value of `k` controls how strict the trending definition is.
 The threshold is:
 
 ```text
-total_day_events / k
+total_day_score / k
 ```
 
 So:
@@ -225,10 +233,11 @@ So a company can tune `k` based on business need:
 
 ## Relationship Between `k`, `epsilon`, and Table Size
 
-In this project we use the PDF-style setting:
+In this project we compare two settings:
 
 ```text
-epsilon = 1 / (2k)
+epsilon = 1 / (2k)  baseline, looser bound
+epsilon = 1 / (5k)  stricter bound
 ```
 
 Then:
@@ -253,6 +262,15 @@ larger k = more sensitive trend detection + more memory
 smaller k = stricter trend detection + less memory
 ```
 
+If the epsilon divisor increases from 2 to 5:
+
+```text
+epsilon becomes smaller
+width becomes larger
+memory increases
+false positives usually decrease
+```
+
 ## What The Current Run Means
 
 The current result uses:
@@ -264,10 +282,10 @@ k = 100
 This means we are looking for products that received at least about 1% of a
 day's product activity.
 
-Because only 13 heavy-hitter rows were found across 139 days, the dataset does
-not have many days where one product dominates the full day's activity. That is
-not a failure. It means the current `k` is strict and is only catching strong
-daily product spikes.
+With `epsilon = 1 / (2k)`, 10 weighted heavy-hitter rows were found. With the
+stricter `epsilon = 1 / (5k)`, 6 weighted heavy-hitter rows were found. The
+stricter setting removed the 4 near-threshold false positives in this dataset.
+That is not a failure. It shows how the error bound controls the output quality.
 
 If the business wants more products per day, it can increase `k`.
 
@@ -278,11 +296,11 @@ If the business wants only very dominant products, it can decrease `k`.
 This project does not produce a fixed top-N list. It produces an approximate
 daily heavy-hitter list.
 
-That means each reported product has enough estimated frequency to cross the
-business-defined trend threshold:
+That means each reported product has enough estimated weighted score to cross
+the business-defined trend threshold:
 
 ```text
-total_day_events / k
+total_day_score / k
 ```
 
 This makes the system scalable, explainable, and useful for large product-based

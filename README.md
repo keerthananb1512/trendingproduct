@@ -13,19 +13,19 @@ The system answers one practical business question:
 
 In this dataset, `itemid` represents a product. In a real company, that product
 could be something like wireless earbuds, running shoes, sunscreen, or a phone
-case. Count-Min Sketch lets us estimate product frequencies efficiently without
+case. Count-Min Sketch lets us estimate product trend scores efficiently without
 storing exact counters for every product in a massive event stream.
 
 ## Core Idea
 
-Given a stream of `n` product events and a threshold parameter `k`, find every
-product that appears at least:
+Given a stream with total daily weighted score `n` and a threshold parameter
+`k`, find every product whose weighted engagement score is at least:
 
 ```text
 n / k
 ```
 
-times.
+points.
 
 These products are called heavy hitters. In this project, heavy hitters are the
 daily trending products.
@@ -33,13 +33,13 @@ daily trending products.
 Example:
 
 ```text
-n = 10,000 product events in one day
+n = 10,000 weighted engagement points in one day
 k = 100
 threshold = n / k = 100
 ```
 
-So any product that appears at least 100 times that day should be detected as a
-trending product.
+So any product with at least 100 weighted engagement points that day should be
+detected as a trending product.
 
 This is not the same as sorting all products and taking a normal top 10 list.
 
@@ -66,8 +66,14 @@ Example:
 2015-06-02,addtocart,5206
 ```
 
-For the first version, `itemid` is the product identifier and each row is one
-product event.
+`itemid` is the product identifier. The `event` column is used to weight user
+intent:
+
+```text
+view = 1
+addtocart = 3
+transaction = 5
+```
 
 ## Daily Window Approach
 
@@ -77,15 +83,16 @@ For each date:
 
 1. Take only the events from that date.
 2. Treat the events as a stream.
-3. Feed each `itemid` into Count-Min Sketch.
-4. Track potential heavy hitters while the stream is processed.
-5. At the end of the day, output products whose estimated count is at least
+3. Convert the event type into a weight.
+4. Feed each `itemid` and weight into Count-Min Sketch.
+5. Track potential heavy hitters while the stream is processed.
+6. At the end of the day, output products whose estimated score is at least
    `n / k`.
 
 This gives a daily trending-product list:
 
 ```text
-date,itemid,estimated_count,threshold
+date,itemid,estimated_score,threshold
 ```
 
 ## Count-Min Sketch
@@ -99,15 +106,15 @@ rows = number of hash functions
 width = number of buckets per row
 ```
 
-For each product event `x`:
+For each weighted product event `x`:
 
 ```text
 for each row i:
     bucket = hash_i(x) mod width
-    CMS[i][bucket] += 1
+    CMS[i][bucket] += event_weight
 ```
 
-To estimate the count of product `x`:
+To estimate the score of product `x`:
 
 ```text
 estimate(x) = min(CMS[i][hash_i(x) mod width]) over all rows
@@ -156,7 +163,7 @@ Here:
 The Count-Min Sketch guarantee is:
 
 ```text
-estimated_count(x) <= true_count(x) + epsilon * n
+estimated_score(x) <= true_score(x) + epsilon * n
 ```
 
 with probability at least:
@@ -168,18 +175,20 @@ with probability at least:
 So if `delta = 0.01`, then the estimate satisfies the error bound with about
 99% confidence.
 
-For heavy hitters:
+For heavy hitters, I compare two epsilon choices:
 
 ```text
-epsilon = 1 / (2k)
+baseline: epsilon = 1 / (2k)
+stricter: epsilon = 1 / (5k)
 ```
 
 Why:
 
 - The heavy-hitter threshold is `n / k`.
 - The Count-Min Sketch error is controlled around `epsilon * n`.
-- Setting `epsilon = 1 / (2k)` makes the error bound `n / (2k)`, which is half
-  of the heavy-hitter threshold.
+- Setting `epsilon = 1 / (2k)` makes the error bound half of the threshold.
+- Setting `epsilon = 1 / (5k)` makes the error bound one-fifth of the threshold.
+- Smaller epsilon means fewer false positives, but it needs more buckets.
 
 This means if the threshold is:
 
@@ -199,6 +208,12 @@ With `epsilon = 1 / (2k)`, that becomes:
 n / k - n / (2k) = n / (2k)
 ```
 
+With `epsilon = 1 / (5k)`, that becomes:
+
+```text
+n / k - n / (5k) = 4n / (5k)
+```
+
 So the final output is expected to contain:
 
 1. All products whose true frequency is at least `n / k`.
@@ -209,19 +224,22 @@ So the final output is expected to contain:
 Example with `k = 100` and `delta = 0.01`:
 
 ```text
-epsilon = 1 / 200 = 0.005
-width = ceil(e / 0.005) = 544
 rows = ceil(ln(100)) = 5
-table size = 5 x 544 = 2,720 counters
 ```
 
-This is very small compared with storing exact counters for all products.
+| Epsilon choice | Error as part of threshold | Width | Table size |
+|---|---:|---:|---:|
+| `1 / (2k)` | 50% | 544 | 2,720 counters |
+| `1 / (5k)` | 20% | 1,360 | 6,800 counters |
+
+Both are still small compared with storing exact counters for all products.
 
 For a day with `n = 10,000` events:
 
 ```text
 heavy-hitter threshold = n / k = 10,000 / 100 = 100
-error bound = epsilon * n = 0.005 * 10,000 = 50
+error bound with 1/(2k) = 50
+error bound with 1/(5k) = 20
 confidence = 1 - delta = 99%
 ```
 
@@ -261,10 +279,10 @@ candidate_set = empty
 for each itemid x in the day stream:
     m += 1
     update CMS with x
-    estimated_count = estimate(x)
+    estimated_score = estimate(x)
     current_threshold = m / k
 
-    if estimated_count >= current_threshold:
+    if estimated_score >= current_threshold:
         add or update x in candidate_set
 ```
 
@@ -303,13 +321,12 @@ Because Count-Min Sketch overestimates counts, the output has this meaning:
 So our result is an approximate daily trending list, not an exact sorted product
 leaderboard.
 
-Example with `n = 10,000`, `k = 100`, and `epsilon = 0.005`:
+Example with `n = 10,000`, `k = 100`:
 
-| True Product Frequency | Meaning |
-|---:|---|
-| `>= 100` | Definitely a heavy hitter target. |
-| `50` to `99` | Near the threshold; may appear due to approximation. |
-| `< 50` | Should not appear except with low probability. |
+| Epsilon choice | True score range that may become false positive |
+|---|---|
+| `1 / (2k)` | `50` to `99` |
+| `1 / (5k)` | `80` to `99` |
 
 The probability of a bad estimate is controlled by `delta`. With
 `delta = 0.01`, the failure probability is about 1%.
@@ -320,18 +337,19 @@ For each date:
 
 1. Initialize Count-Min Sketch.
 2. Initialize an empty candidate set.
-3. Stream that day's `itemid` values one by one.
-4. Update the sketch for each `itemid`.
-5. Estimate the current item's count.
-6. If the estimate crosses `m / k`, keep it as a candidate.
-7. After the day ends, use final threshold `n / k`.
-8. Output candidates whose estimated count is at least `n / k`.
+3. Stream that day's events one by one.
+4. Convert event type to weight: `view = 1`, `addtocart = 3`, `transaction = 5`.
+5. Update the sketch for each `itemid` by that event weight.
+6. Estimate the current item's weighted score.
+7. If the estimate crosses `m / k`, keep it as a candidate.
+8. After the day ends, use final threshold `n / k`.
+9. Output candidates whose estimated score is at least `n / k`.
 
 ## Expected Output
 
 ```text
-date,itemid,estimated_count,exact_count,error,threshold,total_day_events
-2015-05-03,203248,160,141,19,136.83,13683
+date,itemid,estimated_score,exact_score,error,threshold,total_day_score
+2015-05-24,290250,257,251,6,182.76,18276
 ```
 
 ## Validation
@@ -342,7 +360,7 @@ exact counting.
 During validation, the program also keeps an exact per-day counter:
 
 ```text
-exact_count[itemid] += 1
+exact_score[itemid] += event_weight
 ```
 
 This exact counter is used only for checking the result. The scalable algorithm
@@ -357,28 +375,25 @@ results/daily_heavy_hitters_validated.csv
 It contains:
 
 ```text
-date,itemid,estimated_count,exact_count,error,threshold,total_day_events
+date,itemid,estimated_score,exact_score,error,threshold,total_day_score
 ```
 
 where:
 
 ```text
-error = estimated_count - exact_count
+error = estimated_score - exact_score
 ```
 
-For the current run with `k = 100`, the validation showed:
+For the current run with `k = 100`, the validation comparison showed:
 
-| Metric | Value |
-|---|---:|
-| CMS reported heavy-hitter rows | 13 |
-| Exact true heavy hitters | 7 |
-| Exact true heavy hitters missed by CMS | 0 |
-| Near-threshold false positives | 6 |
-| Maximum overestimation error | 34 |
+| Epsilon choice | Width | Counters | Reported rows | True heavy hitters | False positives | Total error | Max error |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `1 / (2k)` | 544 | 2,720 | 10 | 6 | 4 | 233 | 35 |
+| `1 / (5k)` | 1,360 | 6,800 | 6 | 6 | 0 | 56 | 19 |
 
 This matches the expected Count-Min Sketch behavior: it found all true heavy
-hitters, did not underestimate counts, and included a few near-threshold products
-because collisions increased their estimated counts.
+hitters in both runs. The stricter epsilon used more memory but reduced
+collision error and removed the near-threshold false positives in this dataset.
 
 ## Why This Is Useful
 
@@ -387,13 +402,10 @@ expensive when the event stream is huge. Count-Min Sketch gives a compact,
 streaming-friendly way to detect products that are receiving unusually high
 attention each day.
 
-The first version uses daily windows. Future versions can extend the same idea
-to hourly sliding windows, category-wise trends, and weighted events such as:
+This version uses daily windows and weighted events:
 
 ```text
-view = 1
-addtocart = 3
-transaction = 5
+view = 1, addtocart = 3, transaction = 5
 ```
 
 ## Next Implementation Step

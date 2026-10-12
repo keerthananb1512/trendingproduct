@@ -1,7 +1,10 @@
 #include "count_min_sketch.hpp"
+
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
@@ -12,36 +15,51 @@
 
 namespace {
 
-struct DailyResult {
+constexpr std::size_t kView = 0;
+constexpr std::size_t kAddToCart = 1;
+constexpr std::size_t kTransaction = 2;
+constexpr std::size_t kEventTypeCount = 3;
+
+constexpr std::array<const char*, kEventTypeCount> kOutputFiles = {
+    "most_viewed.csv",
+    "most_added_to_cart.csv",
+    "most_purchased.csv",
+};
+
+struct EventResult {
     std::string date;
     std::uint64_t item_id;
-    std::uint64_t estimated_score;
-    std::uint64_t exact_score;
+    std::uint64_t estimated_count;
+    std::uint64_t exact_count;
     std::int64_t error;
     double threshold;
-    std::uint64_t total_day_score;
+    std::uint64_t total_day_events;
 };
 
 struct ProductEvent {
     std::uint64_t item_id;
-    std::uint64_t weight;
+    std::size_t type;
+};
+
+struct DailyAnalysis {
+    std::array<std::vector<EventResult>, kEventTypeCount> event_results;
 };
 
 std::uint64_t parse_item_id(const std::string& value) {
     return static_cast<std::uint64_t>(std::stoull(value));
 }
 
-std::uint64_t event_weight(const std::string& event_type) {
+std::size_t event_type_index(const std::string& event_type) {
     if (event_type == "view") {
-        return 1;
+        return kView;
     }
     if (event_type == "addtocart") {
-        return 3;
+        return kAddToCart;
     }
     if (event_type == "transaction") {
-        return 5;
+        return kTransaction;
     }
-    return 1;
+    return kEventTypeCount;
 }
 
 std::unordered_map<std::string, std::vector<ProductEvent>> read_daily_events(
@@ -71,17 +89,25 @@ std::unordered_map<std::string, std::vector<ProductEvent>> read_daily_events(
         const std::string event_type =
             line.substr(first_comma + 1, second_comma - first_comma - 1);
         const std::string item_value = line.substr(second_comma + 1);
-        if (date.empty() || event_type.empty() || item_value.empty()) {
+        const std::size_t type = event_type_index(event_type);
+        if (date.empty() || item_value.empty() || type == kEventTypeCount) {
             continue;
         }
 
-        events_by_date[date].push_back({parse_item_id(item_value), event_weight(event_type)});
+        events_by_date[date].push_back({parse_item_id(item_value), type});
     }
 
     return events_by_date;
 }
 
-std::vector<DailyResult> find_daily_heavy_hitters(
+std::uint64_t exact_count_for(
+    const std::unordered_map<std::uint64_t, std::uint64_t>& counts,
+    std::uint64_t item_id) {
+    const auto found = counts.find(item_id);
+    return found == counts.end() ? 0 : found->second;
+}
+
+DailyAnalysis analyze_day(
     const std::string& date,
     const std::vector<ProductEvent>& events,
     std::size_t k,
@@ -91,78 +117,84 @@ std::vector<DailyResult> find_daily_heavy_hitters(
     const auto width = static_cast<std::size_t>(std::ceil(std::exp(1.0) / epsilon));
     const auto rows = static_cast<std::size_t>(std::ceil(std::log(1.0 / delta)));
 
-    CountMinSketch sketch(rows, width);
-    std::unordered_set<std::uint64_t> candidates;
-    std::unordered_map<std::uint64_t, std::uint64_t> exact_scores;
+    std::array<CountMinSketch, kEventTypeCount> sketches = {
+        CountMinSketch(rows, width),
+        CountMinSketch(rows, width),
+        CountMinSketch(rows, width),
+    };
+    std::array<std::unordered_set<std::uint64_t>, kEventTypeCount> event_candidates;
+    std::array<std::unordered_map<std::uint64_t, std::uint64_t>, kEventTypeCount>
+        exact_counts;
+    std::array<std::uint64_t, kEventTypeCount> total_events = {0, 0, 0};
 
-    std::uint64_t processed_score = 0;
     for (const ProductEvent& event : events) {
-        processed_score += event.weight;
-        sketch.update(event.item_id, event.weight);
-        exact_scores[event.item_id] += event.weight;
+        sketches[event.type].update(event.item_id);
+        ++exact_counts[event.type][event.item_id];
+        ++total_events[event.type];
 
-        const std::uint64_t estimated_score = sketch.estimate(event.item_id);
-        const double current_threshold =
-            static_cast<double>(processed_score) / static_cast<double>(k);
-
-        if (static_cast<double>(estimated_score) >= current_threshold) {
-            candidates.insert(event.item_id);
+        const std::uint64_t event_estimate = sketches[event.type].estimate(event.item_id);
+        const double event_threshold =
+            static_cast<double>(total_events[event.type]) / static_cast<double>(k);
+        if (static_cast<double>(event_estimate) >= event_threshold) {
+            event_candidates[event.type].insert(event.item_id);
         }
     }
 
-    const std::uint64_t total_day_score = processed_score;
-    const double final_threshold =
-        static_cast<double>(total_day_score) / static_cast<double>(k);
+    DailyAnalysis analysis;
 
-    std::vector<DailyResult> results;
-    results.reserve(candidates.size());
+    for (std::size_t type = 0; type < kEventTypeCount; ++type) {
+        const double threshold =
+            static_cast<double>(total_events[type]) / static_cast<double>(k);
+        auto& results = analysis.event_results[type];
+        results.reserve(event_candidates[type].size());
 
-    for (const std::uint64_t item_id : candidates) {
-        const std::uint64_t estimated_score = sketch.estimate(item_id);
-        if (static_cast<double>(estimated_score) >= final_threshold) {
-            const std::uint64_t exact_score = exact_scores.at(item_id);
-            const auto error = static_cast<std::int64_t>(estimated_score) -
-                               static_cast<std::int64_t>(exact_score);
+        for (const std::uint64_t item_id : event_candidates[type]) {
+            const std::uint64_t estimate = sketches[type].estimate(item_id);
+            if (static_cast<double>(estimate) < threshold) {
+                continue;
+            }
+
+            const std::uint64_t exact = exact_count_for(exact_counts[type], item_id);
             results.push_back({
                 date,
                 item_id,
-                estimated_score,
-                exact_score,
-                error,
-                final_threshold,
-                total_day_score,
+                estimate,
+                exact,
+                static_cast<std::int64_t>(estimate) - static_cast<std::int64_t>(exact),
+                threshold,
+                total_events[type],
             });
         }
+
+        std::sort(results.begin(), results.end(), [](const EventResult& left,
+                                                     const EventResult& right) {
+            if (left.estimated_count != right.estimated_count) {
+                return left.estimated_count > right.estimated_count;
+            }
+            return left.item_id < right.item_id;
+        });
     }
 
-    std::sort(results.begin(), results.end(), [](const DailyResult& left, const DailyResult& right) {
-        if (left.date != right.date) {
-            return left.date < right.date;
-        }
-        if (left.estimated_score != right.estimated_score) {
-            return left.estimated_score > right.estimated_score;
-        }
-        return left.item_id < right.item_id;
-    });
-
-    return results;
+    return analysis;
 }
 
-void write_results(const std::string& output_path, const std::vector<DailyResult>& results) {
+void write_event_results(
+    const std::filesystem::path& output_path,
+    const std::vector<EventResult>& results) {
     std::ofstream output(output_path);
     if (!output) {
-        throw std::runtime_error("Could not open output file: " + output_path);
+        throw std::runtime_error("Could not open output file: " + output_path.string());
     }
 
-    output << "date,itemid,estimated_score,exact_score,error,threshold,total_day_score\n";
-    for (const DailyResult& result : results) {
+    output << "date,itemid,estimated_count,exact_count,error,threshold,total_day_events\n";
+    for (const EventResult& result : results) {
         output << result.date << ','
                << result.item_id << ','
-               << result.estimated_score << ','
-               << result.exact_score << ','
+               << result.estimated_count << ','
+               << result.exact_count << ','
                << result.error << ','
                << result.threshold << ','
-               << result.total_day_score << '\n';
+               << result.total_day_events << '\n';
     }
 }
 
@@ -171,8 +203,7 @@ void write_results(const std::string& output_path, const std::vector<DailyResult
 int main(int argc, char* argv[]) {
     const std::string input_path =
         argc > 1 ? argv[1] : "data/processed/events_daily_clean.csv";
-    const std::string output_path =
-        argc > 2 ? argv[2] : "results/daily_heavy_hitters_validated.csv";
+    const std::filesystem::path output_directory = argc > 2 ? argv[2] : "results";
     const std::size_t k = argc > 3 ? static_cast<std::size_t>(std::stoull(argv[3])) : 100;
     const double delta = argc > 4 ? std::stod(argv[4]) : 0.01;
     const double epsilon_divisor = argc > 5 ? std::stod(argv[5]) : 5.0;
@@ -199,20 +230,33 @@ int main(int argc, char* argv[]) {
         }
         std::sort(dates.begin(), dates.end());
 
-        std::vector<DailyResult> all_results;
+        std::array<std::vector<EventResult>, kEventTypeCount> all_event_results;
+
         for (const std::string& date : dates) {
-            const auto& item_ids = events_by_date.at(date);
-            auto daily_results = find_daily_heavy_hitters(
-                date, item_ids, k, delta, epsilon_divisor);
-            all_results.insert(all_results.end(), daily_results.begin(), daily_results.end());
+            DailyAnalysis daily = analyze_day(
+                date, events_by_date.at(date), k, delta, epsilon_divisor);
+
+            for (std::size_t type = 0; type < kEventTypeCount; ++type) {
+                auto& destination = all_event_results[type];
+                auto& source = daily.event_results[type];
+                destination.insert(destination.end(), source.begin(), source.end());
+            }
         }
 
-        write_results(output_path, all_results);
+        std::filesystem::create_directories(output_directory);
+        for (std::size_t type = 0; type < kEventTypeCount; ++type) {
+            write_event_results(output_directory / kOutputFiles[type], all_event_results[type]);
+        }
 
         std::cout << "Processed " << dates.size() << " days\n";
+        std::cout << "Used separate view, add-to-cart, and purchase sketches\n";
         std::cout << "Used epsilon = 1 / (" << epsilon_divisor << " * k)\n";
-        std::cout << "Wrote " << all_results.size() << " heavy-hitter rows to "
-                  << output_path << '\n';
+        std::cout << "Wrote " << all_event_results[kView].size()
+                  << " most-viewed rows\n";
+        std::cout << "Wrote " << all_event_results[kAddToCart].size()
+                  << " most-added-to-cart rows\n";
+        std::cout << "Wrote " << all_event_results[kTransaction].size()
+                  << " most-purchased rows\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;
